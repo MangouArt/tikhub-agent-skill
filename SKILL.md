@@ -23,6 +23,98 @@ Authentication:
 - Send every MCP request with `Authorization: Bearer ${TIKHUB_API_KEY}`.
 - Never print, log, or expose the API key.
 
+## Token Boundary
+
+TikHub MCP and Mangou NewAPI Agent Gateway are separate systems with separate tokens:
+
+| Token | Used For | Never Use For |
+|---|---|---|
+| `TIKHUB_API_KEY` | Direct TikHub MCP calls to `https://mcp.tikhub.io/{platform}/mcp` | NewAPI `/v1/agent/*` endpoints |
+| `BILLING_TOKEN` | Mangou NewAPI Agent Gateway registration, auth, balance, recharge, and hosted paid calls | TikHub MCP `initialize`, `tools/list`, or `tools/call` |
+
+`TIKHUB_API_KEY != BILLING_TOKEN`.
+
+Use `TIKHUB_API_KEY` for:
+
+- MCP `initialize`
+- MCP `tools/list`
+- MCP `tools/call`
+
+Use `BILLING_TOKEN` for:
+
+- `GET /v1/agent/auth/check`
+- `GET /v1/agent/balance`
+- `POST /v1/agent/recharge-qr`
+- Other hosted NewAPI Agent Gateway calls
+
+Do not mix MCP sessions, TikHub API keys, billing tokens, or recharge state.
+
+## Optional Mangou NewAPI Agent Gateway
+
+If the runtime uses Mangou NewAPI to manage billing or hosted paid calls, read the gateway skill before calling `/v1/agent/*`:
+
+```text
+https://mangou-newapi.zeabur.app/skills/mangou-newapi/SKILL.md
+```
+
+If `BILLING_TOKEN` is missing, register with the user's email:
+
+```http
+POST https://mangou-newapi.zeabur.app/v1/agents/register/email-code
+Content-Type: application/json
+
+{
+  "email": "user@example.com"
+}
+```
+
+After the user provides the email verification code:
+
+```http
+POST https://mangou-newapi.zeabur.app/v1/agents/register
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "verification_code": "123456",
+  "agent_id": "tikhub-agent"
+}
+```
+
+Store the returned `billing_token` as `BILLING_TOKEN` in the local secret store. Do not print the full token, do not commit it, and do not log the raw registration response.
+
+Before hosted paid calls, check auth and balance:
+
+```bash
+curl -sS "https://mangou-newapi.zeabur.app/v1/agent/auth/check" \
+  -H "Authorization: Bearer ${BILLING_TOKEN}"
+
+curl -sS "https://mangou-newapi.zeabur.app/v1/agent/balance" \
+  -H "Authorization: Bearer ${BILLING_TOKEN}"
+```
+
+If balance is insufficient, request a demo recharge:
+
+```bash
+curl -sS -X POST "https://mangou-newapi.zeabur.app/v1/agent/recharge-qr" \
+  -H "Authorization: Bearer ${BILLING_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "tikhub-agent",
+    "tier": "gems_100",
+    "amount": 100
+  }'
+```
+
+The response includes `payment_id`, `qr_url`, `payment_url`, `amount`, and `currency`.
+
+Validation flow:
+
+1. `GET qr_url` and verify `Content-Type` contains `image/svg+xml`.
+2. `GET payment_url` to simulate a user scanning/opening the payment page.
+3. Recheck `/v1/agent/balance` and confirm the balance increased.
+4. Reopen the same `payment_url` and confirm the balance does not increase again. Payment completion must be idempotent.
+
 ## Platform Endpoints
 
 Check service health first when troubleshooting:
@@ -196,3 +288,31 @@ When using TikHub for a user request:
 - Tool not found: rerun `tools/list` for the same platform and use the exact returned name.
 - Schema validation error: compare `arguments` against the tool's `inputSchema`; do not retry with guessed field names.
 - Empty result: report the queried platform, tool, and arguments, then ask whether to broaden the search.
+- NewAPI `Invalid token`: verify `BILLING_TOKEN`, not `TIKHUB_API_KEY`, is being used for `/v1/agent/*`.
+- NewAPI insufficient balance: run the demo recharge flow or ask the user to top up.
+
+## Smoke Test Helper
+
+Use `scripts/newapi-agent-smoke-test.py` to validate the optional Mangou NewAPI Agent Gateway path without exposing secrets:
+
+```bash
+BILLING_TOKEN=... scripts/newapi-agent-smoke-test.py
+BILLING_TOKEN=... scripts/newapi-agent-smoke-test.py --recharge
+```
+
+The helper redacts `BILLING_TOKEN` in all output. It covers:
+
+- `GET /v1/agent/auth/check`
+- `GET /v1/agent/balance`
+- optional `POST /v1/agent/recharge-qr`
+- `GET qr_url` with `image/svg+xml` verification
+- `GET payment_url`
+- repeated `GET payment_url` idempotency check
+
+## Security Requirements
+
+- Never print full `TIKHUB_API_KEY`.
+- Never print full `BILLING_TOKEN`.
+- Never commit `.env`, email verification codes, raw registration responses, or API responses containing tokens.
+- Redact all secrets as `[REDACTED]` in summaries, logs, and test output.
+- Keep `Mcp-Session-Id` separate from both API keys and billing tokens.
